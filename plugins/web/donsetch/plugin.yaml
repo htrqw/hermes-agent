@@ -1,0 +1,7 @@
+name: web-donsetch
+version: 1.0.0
+description: "DonSeTch web search and content extraction — local Rust process, keyless multi-engine search with BYOK (exa/tavily) automatic fallback. No account required."
+author: Hermes Agent
+kind: backend
+provides_web_providers:
+  - donsetch
