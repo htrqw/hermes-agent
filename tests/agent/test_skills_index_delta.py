@@ -2,6 +2,12 @@
 
 The ``<available_skills>`` index is frozen in the system prompt for the prefix cache, so the change
 is delivered on the per-turn note channel (cloudflare/cloudflare-os#267 port).
+
+As of the skill_search migration, the NORMAL session prompt carries no ``<available_skills>`` block
+(semantic search replaces the inline catalog), so ``stage_skills_index_note`` has no baseline and
+gracefully stages nothing — the model discovers new skills via ``skill_search``, whose vector cache
+invalidates on the skills directory signature. One-shot (``-q``) sessions still render the full
+index and keep the original delta-note behaviour.
 """
 import subprocess
 import sys
@@ -40,46 +46,36 @@ def _home(tmp_path, monkeypatch):
     return tmp_path / "skills"
 
 
-def test_skill_installed_by_another_process_reaches_a_running_process(tmp_path, monkeypatch):
-    """The in-process index cache is keyed on skill files: a write this process never saw (a hub
-    install in another terminal) is not answered from the pre-install cache entry (#92313)."""
-    skills = _home(tmp_path, monkeypatch)
-    _write_skill(skills, "docker-ops", "Run containers.")
-    assert "docker-ops" in pb.build_skills_system_prompt()
-    code = ("import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True); "
-            "p.write_text('---\\nname: terraform-ops\\ndescription: Plan infra.\\n---\\nBody.\\n')")
-    subprocess.run([sys.executable, "-c", code, str(skills / "devops" / "terraform-ops" / "SKILL.md")], check=True)
-    assert "- terraform-ops: Plan infra." in pb.build_skills_system_prompt()
-
-
-def test_long_lived_agent_is_told_each_skill_change_once(tmp_path, monkeypatch):
-    """Every turn checks the index (a long-lived agent never rebuilds its prompt). The note names
-    only what changed, is sent once per change (a fresh agent reading the transcript included,
-    however far back the note is), and retires itself when the change is undone."""
+def test_prompt_without_index_stages_no_note(tmp_path, monkeypatch):
+    """Normal sessions carry no ``<available_skills>`` block (skill_search replaced it), so the
+    delta note has no baseline and must stage nothing rather than announce the whole catalog.
+    A skill added mid-conversation is still discoverable through ``skill_search``."""
     skills = _home(tmp_path, monkeypatch)
     _write_skill(skills, "docker-ops", "Run containers.")
     agent, history = _agent(tmp_path), []
     prompt = "Identity.\n\n" + pb.build_skills_system_prompt()
-    assert _turn(agent, prompt, history) == ""
-
+    assert "<available_skills>" not in prompt
+    assert "skill_search" in prompt
+    assert stage_skills_index_note(agent, prompt, history) is False
+    # A skill added mid-conversation still stages nothing: the model finds it via skill_search.
     _write_skill(skills, "terraform-ops", "Plan infra.")
-    note = _turn(agent, prompt, history)
-    assert "    - terraform-ops: Plan infra." in note and "docker-ops" not in note
+    assert stage_skills_index_note(agent, prompt, history) is False
     assert _turn(agent, prompt, history) == ""
-    history += [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}] * 150
-    assert _turn(_agent(tmp_path), prompt, history) == ""
 
-    (skills / "devops" / "docker-ops" / "SKILL.md").unlink()
-    note = _turn(agent, prompt, history)
-    assert "    - terraform-ops: Plan infra." in note and note.endswith("No longer available: docker-ops]")
 
-    (skills / "devops" / "terraform-ops" / "SKILL.md").unlink()
+def test_skill_installed_by_another_process_reaches_a_running_process(tmp_path, monkeypatch):
+    """The in-process skills cache is keyed on skill files: a write this process never saw (a hub
+    install in another terminal) must not be answered from the pre-install cache entry (#92313).
+    With no inline index the visible surface is ``find_all_skills`` — the catalog ``skill_search``
+    builds its vector index from — so a fresh skill has to show up there."""
+    from tools.skills_tool import clear_skills_cache, find_all_skills
+
+    skills = _home(tmp_path, monkeypatch)
     _write_skill(skills, "docker-ops", "Run containers.")
-    assert "accurate again" in _turn(agent, prompt, history)
-    assert _turn(_agent(tmp_path), prompt, history) == ""
-
-    # A compaction rebuild that now lists the announced skill needs no new note.
-    _write_skill(skills, "terraform-ops", "Plan infra.")
-    assert "terraform-ops" in _turn(agent, prompt, history)
-    rebuilt = "Identity.\n\n" + pb.build_skills_system_prompt()
-    assert _turn(agent, rebuilt, history) == "" and _turn(_agent(tmp_path), rebuilt, history) == ""
+    clear_skills_cache()
+    assert "docker-ops" in {s["name"] for s in find_all_skills()}
+    code = ("import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True); "
+            "p.write_text('---\\nname: terraform-ops\\ndescription: Plan infra.\\n---\\nBody.\\n')")
+    subprocess.run([sys.executable, "-c", code, str(skills / "devops" / "terraform-ops" / "SKILL.md")], check=True)
+    clear_skills_cache()
+    assert "terraform-ops" in {s["name"] for s in find_all_skills()}

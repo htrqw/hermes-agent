@@ -1,6 +1,5 @@
-"""Shape of the <available_skills> index rows (single-skill categories, headers, clipped descriptions)."""
-import re
-
+"""Shape of the skills prompt: no inline index in normal sessions, clipped descriptions where
+descriptions are still rendered (oneshot index, plugin rows)."""
 import pytest
 
 from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
@@ -23,7 +22,10 @@ def _skill(root, rel, desc):
     (d / "SKILL.md").write_text(f"---\nname: {d.name}\ndescription: {desc}\n---\n\nBody.\n", encoding="utf-8")
 
 
-def test_index_rows_carry_each_name_once_and_never_a_half_word(monkeypatch, tmp_path):
+def test_prompt_carries_no_inline_index_and_points_at_skill_search(monkeypatch, tmp_path):
+    """Normal sessions no longer render ``<available_skills>`` rows: skill_search replaced the
+    inline catalog (2.5k -> ~63 tokens). The prompt must instead point the model at skill_search
+    and keep skills_list as the browse-everything escape hatch."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skills = tmp_path / "skills"
     _skill(skills, "creative/ascii-art", "ASCII art banners.")
@@ -34,19 +36,15 @@ def test_index_rows_carry_each_name_once_and_never_a_half_word(monkeypatch, tmp_
     _skill(skills, "github/hermes-release", LONG)
 
     prompt = build_skills_system_prompt()
-    block = re.search(r"<available_skills>\n(.*?)\n</available_skills>", prompt, re.DOTALL).group(1)
-    lines = block.splitlines()
-
-    assert "  creative:" in lines and "Creative content generation" not in block
-    assert "  - computer-use: Drive the desktop." in lines and "  computer-use:" not in lines
-    release = next(line for line in lines if "hermes-release" in line)
-    assert release.startswith("  - hermes-release: ")
-    shown = release.split(": ", 1)[1]
-    assert len(shown) <= SKILL_PROMPT_DESC_LIMIT and shown.endswith("...")
-    kept = shown[:-3]
-    assert LONG.startswith(kept) and LONG[len(kept)] in " ,"  # cut lands between words
-    # The turn-delta parser reads flattened rows like nested ones.
-    assert set(index_entries(prompt)) == {"ascii-art", "pixel-art", "computer-use", "hermes-release"}
+    assert "<available_skills>" not in prompt
+    assert "skill_search(query)" in prompt
+    assert "skills_list" in prompt
+    # The delta parser has no block to read, so nothing is announced from the prompt.
+    assert index_entries(prompt) == {}
+    # The catalog skill_search queries is unaffected by the missing block.
+    from tools.skills_tool import find_all_skills
+    names = {s["name"] for s in find_all_skills()}
+    assert {"ascii-art", "pixel-art", "computer-use", "hermes-release"} <= names
 
 
 @pytest.mark.parametrize("sep", ["\t", "\u00a0"], ids=["tab", "nbsp"])

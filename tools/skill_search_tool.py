@@ -20,6 +20,7 @@ import threading
 import urllib.error
 import urllib.request
 from typing import Any, Optional
+import itertools
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def _lexical_fallback(query: str, skills: list[dict], k: int) -> list[dict]:
 
     tokens = {t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) > 1}
     cjk = re.findall(r"[\u4e00-\u9fff]", query)
-    bigrams = {"".join(p) for p in zip(cjk, cjk[1:])} if len(cjk) >= 2 else set()
+    bigrams = {"".join(p) for p in itertools.pairwise(cjk)} if len(cjk) >= 2 else set()
     scored = []
     for s in skills:
         hay = f"{s['name']} {s.get('description', '')}".lower()
@@ -98,9 +99,9 @@ def _catalog_signature() -> tuple:
 def _build_index(signature: tuple) -> tuple[list[dict], list[list[float]]]:
     """Build (skills, vectors). Vectors may be empty when the embedding server is down —
     the caller then falls back to lexical ranking over the same skill list."""
-    from tools.skills_tool import find_all_skills
+    from tools.skills_tool import find_all_skills_with_plugins
 
-    skills = find_all_skills()
+    skills = find_all_skills_with_plugins()
     docs = [f"{s['name']} | {s.get('description', '')}" for s in skills]
     if not docs:
         return [], []
@@ -169,7 +170,7 @@ def skill_search(query: str, limit: int = 10, task_id: Optional[str] = None) -> 
              "hint": hint},
             ensure_ascii=False,
         )
-    except Exception as e:  # noqa: BLE001 — tool boundary
+    except Exception as e:
         return tool_error(str(e), success=False)
 
 

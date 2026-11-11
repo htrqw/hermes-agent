@@ -282,6 +282,23 @@ def find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any]]:
             for s in _skill_catalog(skip_disabled=skip_disabled) if s["load_name"]]
 
 
+def find_all_skills_with_plugins(*, skip_disabled: bool = False) -> list[dict[str, Any]]:
+    """Like ``find_all_skills`` but ALSO appends plugin-registered skills (the same set
+    ``skills_list`` renders), so semantic search sees everything the inline index used to show."""
+    skills = find_all_skills(skip_disabled=skip_disabled)
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        discover_plugins()
+        for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
+            frontmatter = plugin_skill.pop("frontmatter", {})
+            if not skill_matches_platform(frontmatter) or _is_skill_disabled(plugin_skill["name"]):
+                continue
+            skills.append(plugin_skill)
+    except Exception:
+        logger.debug("Plugin skill listing failed", exc_info=True)
+    return skills
+
+
 def sort_skills(skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
