@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
@@ -50,6 +51,10 @@ _STALL_GUARD_CYCLE_HISTORY = 64
 # aren't worth it, errors never are. The args preview keeps WHAT was called if compression evicts the original.
 IDENTICAL_RESULT_STUB_MIN_CHARS = 512
 _RESULT_STUB_ARGS_PREVIEW_CHARS = 120
+# Hash body for every harness refusal: the refusal text carries a repeat counter that rises per call
+# (``already_searched``/``already_read``), so hashing the body as-is makes an unchanged refusal look
+# like fresh output and both loop detectors restart at 1. See ``_result_hash``.
+_GUARDRAIL_REFUSAL_HASH_BODY = '{"guardrail_refusal":true}'
 
 # Tools whose "failure" is normal work output (red test run, empty grep, page timeout).
 # same_tool_failure (DIFFERENT commands) never halts these; only an exact-args replay with
@@ -629,10 +634,36 @@ def _without_execute_code_metadata(parsed: Any) -> Any:
     return cleaned
 
 
+# ``append_toolguard_guidance`` appends a plaintext notice AFTER the serialized result as
+# ``\n\n[Tool loop warning: <code>; count=N; <message>]``. When the payload is JSON (search_files,
+# read_file, skill_view, ...) that suffix lands outside the closing brace, so ``safe_json_loads``
+# returns None and the hash falls back to the raw string -- whose embedded ``count=N`` changes on
+# every repeat. The no-progress detector then never sees two equal hashes and never reaches
+# ``no_progress_block_after`` (observed: 47 identical ``search_files`` calls in one session, each
+# with a distinct hash). The refusal branch below cannot help: it needs ``parsed``, which is None
+# here. Strip the notice before parsing so the hash covers only the tool's own output. This is the
+# JSON-corruption half of #136238; the refusal-counter half is handled by
+# ``_GUARDRAIL_REFUSAL_HASH_BODY``.
+_TOOLGUARD_SUFFIX_RE = re.compile(r"\n\n\[Tool loop (?:warning|hard stop): [^\n]*\]\s*$")
+
+
+def _strip_toolguard_suffix(result: str) -> str:
+    """Drop a trailing ``[Tool loop warning/hard stop: ...]`` notice appended by the guardrails."""
+    return _TOOLGUARD_SUFFIX_RE.sub("", result)
+
+
 def _result_hash(result: str | None, tool_name: str = "") -> str:
-    parsed = safe_json_loads(result or "")
+    raw = _strip_toolguard_suffix(result or "")
+    parsed = safe_json_loads(raw)
     if parsed is None:
-        return _sha256(result or "")
+        return _sha256(raw)
+    # A harness REFUSAL (repeated read/search) is the same non-result on every replay, but the body
+    # carries a repeat counter -- ``already_searched: 7`` / ``already_read: 9`` -- that rises per call.
+    # Hashed as-is, each refusal looked like NEW output, so the no-progress counter and the identical
+    # call streak restarted at 1 every call and neither hard stop could fire: a worker replayed one
+    # search until an external timeout. The call signature already says WHAT was refused.
+    if is_guardrail_refusal(parsed):
+        return _sha256(_GUARDRAIL_REFUSAL_HASH_BODY)
     if tool_name == "execute_code":
         parsed = _without_execute_code_metadata(parsed)
     return _sha256(_canonical_json(parsed))

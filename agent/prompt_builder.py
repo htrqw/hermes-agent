@@ -387,9 +387,12 @@ TASK_COMPLETION_GUIDANCE = (
     "working until you have actually exercised the code or produced the requested result, then report what real "
     "execution returned.\n"
     "If a tool, install, or network call fails and blocks the real path, say so directly and try an alternative "
-    "(different package manager, different approach, ask the user). NEVER substitute plausible-looking fabricated "
-    "output (made-up data, invented file contents, synthesised API responses) for results you couldn't actually "
-    "produce. Reporting a blocker honestly is always better than inventing a result."
+    "(different package manager, different approach, ask the user). Say it right in your next output while you "
+    "keep working — what failed and which route you're trying next — because a stretch of silent retries is a "
+    "failure even when the work is real: alternate report and attempt, and when the user asks for status, answer "
+    "it first. When the user says stop, end the turn immediately and take no further action. NEVER substitute "
+    "plausible-looking fabricated output (made-up data, invented file contents, synthesised API responses) for "
+    "results you couldn't actually produce. Reporting a blocker honestly is always better than inventing a result."
 )
 
 # Universal parallel-tool-call guidance (ALL models): the runtime already executes independent calls

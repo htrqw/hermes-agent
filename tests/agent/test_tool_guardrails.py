@@ -506,3 +506,127 @@ def test_rate_limited_retry_is_not_a_replay_but_stays_bounded(result, throttled,
             break
     else:
         raise AssertionError("a permanently failing endpoint must still halt or block")
+
+
+# ── Repeat refusals count as one non-result (#141633) ────────────────────────
+
+
+def test_result_hash_of_a_repeat_refusal_ignores_the_rising_counter():
+    """The refusal body carries ``already_searched``/``already_read``, which rises per call."""
+    from agent.tool_guardrails import _result_hash
+
+    refused_4 = json.dumps({"error": "BLOCKED: 4 times in a row", "pattern": "x",
+                            "already_searched": 4, "guardrail_refusal": True})
+    refused_91 = json.dumps({"error": "BLOCKED: 91 times in a row", "pattern": "x",
+                             "already_searched": 91, "guardrail_refusal": True})
+    assert _result_hash(refused_4, "search_files") == _result_hash(refused_91, "search_files")
+
+    # A refusal is still distinguishable from real output, so a real success in between resets.
+    found = json.dumps({"paths": ["a.ts"], "matches": 1})
+    assert _result_hash(refused_4, "search_files") != _result_hash(found, "search_files")
+
+
+def test_rising_refusal_counter_does_not_defeat_the_hard_stop(tmp_path):
+    """A refused repeat is the SAME non-result every call, so the streak must count it.
+
+    ``search_tool``/``read_file_tool`` refuse a repeated call from the 3rd/4th time with a body
+    carrying a rising counter. Hashed whole, every refusal looked like fresh output and both the
+    no-progress counter and the identical-call streak restarted at 1, so a hard-stopped turn never
+    halted -- one worker replayed a single search until an external timeout. Drives the real tools
+    through the real controller.
+    """
+    from tools.file_tools import read_file_tool, search_tool
+
+    (tmp_path / "mod.ts").write_text("export const x = 1;\n" * 40, encoding="utf-8")
+    cases = {
+        "search_files": (
+            {"pattern": "const x", "path": str(tmp_path), "task_id": "t-refuse-search"},
+            lambda: search_tool("const x", path=str(tmp_path), task_id="t-refuse-search"),
+        ),
+        "read_file": (
+            {"path": str(tmp_path / "mod.ts"), "offset": 1, "limit": 7, "task_id": "t-refuse-read"},
+            lambda: read_file_tool(str(tmp_path / "mod.ts"), offset=1, limit=7, task_id="t-refuse-read"),
+        ),
+    }
+    for tool_name, (args, call) in cases.items():
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=5)
+        )
+        refusals = 0
+        for i in range(10):
+            assert controller.before_call(tool_name, args).action == "allow", f"{tool_name}: blocked at {i}"
+            result = call()
+            refusals += json.loads(result).get("guardrail_refusal") is True
+            controller.after_call(tool_name, args, result, failed=False)
+            controller.observe_call(tool_name, args, result, failed=False)
+            if controller.halt_decision is not None:
+                break
+        halt = controller.halt_decision
+        assert refusals >= 5, f"{tool_name}: only {refusals} refusals -- the tool stopped refusing"
+        assert halt is not None, f"{tool_name}: 10 calls, {refusals} identical refusals, and no halt"
+        assert halt.code == "identical_call_streak_halt"
+        assert halt.tool_name == tool_name
+
+
+def test_refusals_of_different_calls_do_not_share_a_streak():
+    """One constant refusal hash must not merge DISTINCT calls -- the signature still separates them."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=2)
+    )
+    for i in range(8):
+        args = {"pattern": f"needle-{i}", "path": "/repo"}
+        refusal = json.dumps({"error": f"BLOCKED: {i + 4} times in a row", "pattern": f"needle-{i}",
+                              "already_searched": i + 4, "guardrail_refusal": True})
+        controller.after_call("search_files", args, refusal, failed=False)
+        controller.observe_call("search_files", args, refusal, failed=False, tool_call_id=f"c{i}")
+    assert controller.halt_decision is None
+
+
+# ── Guardrail guidance appended after a JSON payload (#136238) ───────────────
+
+
+def test_appended_toolguard_notice_does_not_defeat_the_no_progress_hash():
+    """``append_toolguard_guidance`` writes AFTER the closing brace, so the payload stops parsing.
+
+    ``safe_json_loads`` then returns None and the hash fell back to the raw string -- whose embedded
+    ``count=N`` rises per repeat, so every replay hashed differently, ``repeat_count`` never left 1,
+    and neither the warn nor the block threshold could fire (47 identical ``search_files`` calls in
+    one session, 47 distinct hashes). Stripping the notice first lets the hash see the tool's own
+    output again.
+    """
+    from agent.tool_guardrails import _result_hash, _strip_toolguard_suffix
+    from utils import safe_json_loads
+
+    payload = json.dumps({"total_count": 61, "matches_text": "/repo/a.py\n  36: x = 1"})
+    with_notice = payload + (
+        "\n\n[Tool loop warning: idempotent_no_progress_warning; count=2; "
+        "search_files returned the same result 2 times. Use the result already provided.]"
+    )
+    assert safe_json_loads(with_notice) is None, "the notice really does break JSON parsing"
+    assert _strip_toolguard_suffix(with_notice) == payload
+    assert _result_hash(with_notice, "search_files") == _result_hash(payload, "search_files")
+
+    # The rising counter must not be able to manufacture a fresh hash either.
+    later = payload + (
+        "\n\n[Tool loop warning: idempotent_no_progress_warning; count=9; "
+        "search_files returned the same result 9 times. Use the result already provided.]"
+    )
+    assert _result_hash(later, "search_files") == _result_hash(payload, "search_files")
+
+
+def test_a_hard_stop_notice_is_stripped_too():
+    """The halt notice uses the same trailer shape and must hash identically to the bare payload."""
+    from agent.tool_guardrails import _result_hash
+
+    payload = json.dumps({"ok": True, "n": 1})
+    halted = payload + "\n\n[Tool loop hard stop: idempotent_no_progress_block; count=5; Blocked search_files.]"
+    assert _result_hash(halted, "search_files") == _result_hash(payload, "search_files")
+
+
+def test_a_bracket_in_payload_is_not_mistaken_for_a_notice():
+    """Only a trailing notice is dropped; brackets inside the payload stay part of the hash."""
+    from agent.tool_guardrails import _result_hash
+
+    a = json.dumps({"text": "see [notes]"})
+    b = json.dumps({"text": "see [other]"})
+    assert _result_hash(a, "read_file") != _result_hash(b, "read_file")
